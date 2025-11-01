@@ -1,40 +1,179 @@
 # app/services/huggingface_service.py
 """
-FIXED Hugging Face API integration with multiple models and fallback + RULE-BASED ANSWERS
+Complete Groq AI integration for resume extraction AND Q&A
 """
-import httpx
+import os
+from huggingface_hub import InferenceClient
 from app.config import settings
 from app.core.logger import get_logger
 from typing import Dict, Any, Optional
+import asyncio
 import json
 import re
-import asyncio
 
 logger = get_logger(__name__)
 
 
 class HuggingFaceService:
-    """Handle Hugging Face API calls for ML inference with robust fallback"""
+    """Handle all AI tasks using FREE Groq provider"""
     
     def __init__(self):
-        self.api_key = settings.HUGGINGFACE_API_KEY
-        self.api_url = "https://router.huggingface.co/hf-inference/models"
-        self.headers = {"Authorization": f"Bearer {self.api_key}"}
+        # Set up the Hugging Face token
+        os.environ["HF_TOKEN"] = settings.HUGGINGFACE_API_KEY
         
-        # Multiple models to try (in order of preference)
-        self.extraction_models = [
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            "microsoft/Phi-3-mini-4k-instruct",
-            "HuggingFaceH4/zephyr-7b-beta",
-        ]
+        # Initialize InferenceClient with Groq provider (FREE!)
+        self.client = InferenceClient(
+            provider="groq",
+            api_key=os.environ["HF_TOKEN"]
+        )
         
-        self.qa_models = [
-            "mistralai/Mistral-7B-Instruct-v0.2",
-            "microsoft/Phi-3-mini-4k-instruct",
-            "HuggingFaceH4/zephyr-7b-beta",
-        ]
+        # Free model available through Groq
+        self.model = "openai/gpt-oss-safeguard-20b"
     
-    # [Keep all existing extract_resume_info methods unchanged...]
+    async def extract_resume_info(self, resume_text: str) -> Dict[str, Any]:
+        """
+        Extract structured information from resume using Groq AI
+        
+        Args:
+            resume_text: Raw text extracted from resume file
+            
+        Returns:
+            Dictionary with extracted candidate information
+        """
+        try:
+            logger.info(f"🤖 Extracting resume info with Groq AI (text length: {len(resume_text)})")
+            
+            # Truncate if too long (to fit in context)
+            if len(resume_text) > 4000:
+                logger.warning(f"⚠️ Resume text too long ({len(resume_text)} chars), truncating to 4000")
+                resume_text = resume_text[:4000]
+            
+            prompt = f"""Extract structured information from this resume and return ONLY valid JSON.
+
+Resume Text:
+{resume_text}
+
+Return a JSON object with these fields (use empty string/array if not found):
+{{
+    "introduction": "Full Name | Email: email@example.com | Phone: +1234567890",
+    "education": {{
+        "degree": "Bachelor of Technology in Computer Science",
+        "institution": "University Name",
+        "field": "Computer Science",
+        "year": "2023"
+    }},
+    "experience": {{
+        "total_years": "3 years",
+        "companies": "Company A, Company B",
+        "positions": "Software Engineer, Developer"
+    }},
+    "skills": ["Python", "JavaScript", "React", "Node.js"],
+    "projects": ["E-commerce Platform", "Chat Application"],
+    "hobbies": ["Reading", "Gaming", "Photography"],
+    "certifications": ["AWS Certified Developer", "Google Cloud Associate"]
+}}
+
+CRITICAL: Return ONLY the JSON object, no markdown, no explanation, no extra text."""
+
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                self._extract_sync,
+                prompt
+            )
+            
+            if result:
+                logger.info(f"✅ Successfully extracted resume info with Groq")
+                logger.info(f"📊 Extracted: {len(result.get('skills', []))} skills, {len(result.get('projects', []))} projects")
+                return result
+            else:
+                logger.warning("⚠️ Groq extraction returned empty, using fallback")
+                return self._get_default_structure()
+                
+        except Exception as e:
+            logger.error(f"❌ Error extracting resume with Groq: {str(e)}")
+            return self._get_default_structure()
+    
+    def _extract_sync(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """Synchronous call to Groq for extraction"""
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": "You are a resume parser that extracts structured data. Always return valid JSON only, no markdown formatting."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,  # Low temperature for consistent extraction
+                max_tokens=1500
+            )
+            
+            response_text = completion.choices[0].message.content.strip()
+            logger.info(f"📥 Groq extraction response: {response_text[:200]}...")
+            
+            # Clean the response
+            response_text = self._clean_json_response(response_text)
+            
+            # Parse JSON
+            parsed = json.loads(response_text)
+            
+            # Validate structure
+            return self._validate_and_fix_structure(parsed)
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ JSON decode error: {str(e)}")
+            logger.error(f"Raw response: {response_text[:500]}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Groq extraction error: {str(e)}")
+            return None
+    
+    def _clean_json_response(self, text: str) -> str:
+        """Clean JSON response from potential markdown or extra text"""
+        # Remove markdown code blocks
+        text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^```\s*', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
+        
+        # Find JSON object
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            return json_match.group(0)
+        
+        return text
+    
+    def _validate_and_fix_structure(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and fix extracted data structure"""
+        fixed = {
+            "introduction": str(data.get("introduction", "")),
+            "education": data.get("education", {}) if isinstance(data.get("education"), dict) else {},
+            "experience": data.get("experience", {}) if isinstance(data.get("experience"), dict) else {},
+            "skills": data.get("skills", []) if isinstance(data.get("skills"), list) else [],
+            "projects": data.get("projects", []) if isinstance(data.get("projects"), list) else [],
+            "hobbies": data.get("hobbies", []) if isinstance(data.get("hobbies"), list) else [],
+            "certifications": data.get("certifications", []) if isinstance(data.get("certifications"), list) else []
+        }
+        
+        # Ensure education has proper structure
+        if fixed["education"]:
+            fixed["education"] = {
+                "degree": str(fixed["education"].get("degree", "")),
+                "institution": str(fixed["education"].get("institution", "")),
+                "field": str(fixed["education"].get("field", "")),
+                "year": str(fixed["education"].get("year", ""))
+            }
+        
+        # Ensure experience has proper structure
+        if fixed["experience"]:
+            fixed["experience"] = {
+                "total_years": str(fixed["experience"].get("total_years", "")),
+                "companies": str(fixed["experience"].get("companies", "")),
+                "positions": str(fixed["experience"].get("positions", ""))
+            }
+        
+        return fixed
     
     async def answer_question(self, question: str, candidate_data: Dict[str, Any]) -> str:
         """Answer questions about candidate - WITH RULE-BASED FALLBACK"""
@@ -45,94 +184,33 @@ class HuggingFaceService:
             logger.info(f"✅ Answered with rule-based logic: {rule_based_answer[:100]}")
             return rule_based_answer
         
-        # SECOND: Try LLM if rule-based failed
-        context = self._prepare_context(candidate_data)
-        logger.info(f"📝 Context prepared:\n{context[:300]}...")
-        
-        # Try each QA model
-        for model in self.qa_models:
-            try:
-                logger.info(f"🤖 Answering with: {model}")
+        # SECOND: Try Groq LLM if rule-based failed
+        try:
+            context = self._prepare_context(candidate_data)
+            logger.info(f"🔍 Context prepared, asking Groq...")
+            
+            prompt = f"""Answer this question about a job candidate concisely.
+
+Candidate Information:
+{context}
+
+Question: {question}
+
+Provide a clear, direct answer based only on the information above. Keep it brief (1-2 sentences)."""
+
+            loop = asyncio.get_event_loop()
+            answer = await loop.run_in_executor(
+                None,
+                self._ask_groq_sync,
+                prompt
+            )
+            
+            if answer and len(answer) > 5:
+                logger.info(f"✅ Groq answered: {answer[:100]}")
+                return answer
                 
-                if "mistral" in model.lower():
-                    prompt = f"""<s>[INST] Answer this question about a job candidate concisely.
-
-Candidate Information:
-{context}
-
-Question: {question}
-
-Provide a clear, direct answer based only on the information above. Keep it brief (1-2 sentences). [/INST]"""
-                elif "phi" in model.lower():
-                    prompt = f"""<|system|>
-You are a helpful assistant that answers questions about job candidates.<|end|>
-<|user|>
-Candidate Information:
-{context}
-
-Question: {question}
-
-Answer clearly and concisely based on the information provided.<|end|>
-<|assistant|>"""
-                else:
-                    prompt = f"""<|system|>
-You are a helpful assistant answering questions about job candidates.</s>
-<|user|>
-Candidate Information:
-{context}
-
-Question: {question}
-
-Answer clearly and concisely.</s>
-<|assistant|>"""
-
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(
-                        f"{self.api_url}/{model}",
-                        headers=self.headers,
-                        json={
-                            "inputs": prompt,
-                            "parameters": {
-                                "max_new_tokens": 200,
-                                "temperature": 0.3,
-                                "top_p": 0.9,
-                                "do_sample": True,
-                                "return_full_text": False
-                            },
-                            "options": {
-                                "wait_for_model": True,
-                                "use_cache": False
-                            }
-                        }
-                    )
-                    
-                    logger.info(f"📥 Response status: {response.status_code}")
-                    
-                    if response.status_code == 503:
-                        logger.warning("Model loading, trying next model...")
-                        continue
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        if isinstance(result, list) and len(result) > 0:
-                            answer = result[0].get("generated_text", "").strip()
-                            if answer and len(answer) > 5:
-                                logger.info(f"✅ LLM answered: {answer[:100]}")
-                                return answer
-                        elif isinstance(result, dict):
-                            answer = result.get("generated_text", "").strip()
-                            if answer and len(answer) > 5:
-                                return answer
-                    
-                    logger.warning(f"❌ {model} failed - Status: {response.status_code}, Response: {response.text[:200]}")
-                    
-            except asyncio.TimeoutError:
-                logger.error(f"⏰ Timeout with {model}")
-                continue
-            except Exception as e:
-                logger.error(f"❌ Error with {model}: {str(e)}")
-                continue
+        except Exception as e:
+            logger.error(f"❌ Error with Groq QA: {str(e)}")
         
         # THIRD: If LLM failed, try rule-based one more time with looser matching
         fallback_answer = self._try_rule_based_answer(question, candidate_data, strict=False)
@@ -140,6 +218,25 @@ Answer clearly and concisely.</s>
             return fallback_answer
         
         return "Unable to generate answer. Please try rephrasing your question."
+    
+    def _ask_groq_sync(self, prompt: str) -> Optional[str]:
+        """Synchronous question answering via Groq"""
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant answering questions about job candidates. Be concise and direct."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=200
+            )
+            
+            return completion.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"❌ Groq QA error: {str(e)}")
+            return None
     
     def _try_rule_based_answer(self, question: str, candidate_data: Dict[str, Any], strict: bool = True) -> Optional[str]:
         """
@@ -321,3 +418,24 @@ Answer clearly and concisely.</s>
                 parts.append(f"Certifications: {', '.join(certs[:10])}")
         
         return "\n".join(parts)
+    
+    def _get_default_structure(self) -> Dict[str, Any]:
+        """Return default empty structure if extraction fails"""
+        return {
+            "introduction": "",
+            "education": {
+                "degree": "",
+                "institution": "",
+                "field": "",
+                "year": ""
+            },
+            "experience": {
+                "total_years": "",
+                "companies": "",
+                "positions": ""
+            },
+            "skills": [],
+            "projects": [],
+            "hobbies": [],
+            "certifications": []
+        }
