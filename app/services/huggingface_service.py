@@ -18,7 +18,7 @@ class HuggingFaceService:
     
     def __init__(self):
         self.api_key = settings.HUGGINGFACE_API_KEY
-        self.api_url = "https://api-inference.huggingface.co/models"
+        self.api_url = "https://router.huggingface.co/hf-inference/models"
         self.headers = {"Authorization": f"Bearer {self.api_key}"}
         
         # Multiple models to try (in order of preference)
